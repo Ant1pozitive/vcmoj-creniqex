@@ -21,13 +21,18 @@ def train(args):
         max_seq_len=args.seq_len-1,
         num_codebooks=args.num_codebooks, codebook_size=args.codebook_size,
         commitment_weight=1.0, contrastive_weight=1.0,
-        cj_k_channels=args.cj_k_channels, cj_jitter_std=args.cj_jitter_std
+        cj_k_channels=args.cj_k_channels, cj_jitter_std=args.cj_jitter_std,
+        eck_key_dim=args.eck_key_dim, eck_topk=(args.eck_topk if args.eck_topk>0 else None)
     )
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    loss_fn = VC_MOJI_Loss(recon_weight=1.0, kl_weight=args.kl_weight, ortho_weight=args.ortho_weight,
-                           commitment_weight=args.commitment_weight, contrastive_weight=args.contrastive_weight)
+    loss_fn = VC_MOJI_Loss(
+        recon_weight=1.0, kl_weight=args.kl_weight, ortho_weight=args.ortho_weight,
+        commitment_weight=args.commitment_weight, contrastive_weight=args.contrastive_weight,
+        rce_eps=args.rce_eps, rce_kernel_scale=args.rce_kernel_scale,
+        jreg_weight=args.jreg_weight, jreg_iters=args.jreg_iters
+    )
 
     global_step = 0
     model.train()
@@ -38,16 +43,31 @@ def train(args):
             xb = xb.to(device)
             yb = yb.to(device)
             optimizer.zero_grad()
-            logits, mus, logvars, commit_total, contrast_total, cj_gates = model(xb)
+            # request embeddings for jacobian if jreg_weight > 0
+            need_emb = args.jreg_weight > 0.0
+            outputs = model(xb, return_emb_for_jacobian=need_emb)
+            if need_emb:
+                logits, mus, logvars, commit_total, contrast_total, cj_gates, eck_stats_list, emb = outputs
+            else:
+                logits, mus, logvars, commit_total, contrast_total, cj_gates, eck_stats_list = outputs
+                emb = None
+
             loss, metrics = loss_fn(logits, yb, mus, logvars, model=model,
-                                    commit_loss_tensor=commit_total, contrastive_loss_tensor=contrast_total)
+                                    commit_loss_tensor=commit_total, contrastive_loss_tensor=contrast_total,
+                                    emb_for_jacobian=emb)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             running_loss = 0.9 * running_loss + 0.1 * loss.item() if global_step>0 else loss.item()
+
+            # aggregate some readable stats
+            avg_cj_gate = sum([g for g in cj_gates]) / len(cj_gates) if len(cj_gates)>0 else 0.0
+            avg_eck_gate = sum([s['mean_gate'] for s in eck_stats_list]) / len(eck_stats_list) if len(eck_stats_list)>0 else 0.0
+
             pbar.set_description(
-                f"E{epoch} L{running_loss:.4f} r{metrics['recon']:.4f} kl{metrics['kl']:.4f} cmt{metrics['commit']:.6f} ctr{metrics['contrast']:.6f}"
+                f"E{epoch} L{running_loss:.4f} r{metrics['rce_recon']:.4f} kl{metrics['kl']:.4f} commit{metrics['commit']:.6f} jpen{metrics['jpen']:.6f}"
             )
             global_step += 1
 
@@ -79,7 +99,15 @@ if __name__ == "__main__":
     parser.add_argument('--codebook_size', type=int, default=256)
     parser.add_argument('--cj_k_channels', type=int, default=36)
     parser.add_argument('--cj_jitter_std', type=float, default=0.02)
+    # NEW flags for ECK / r48 / jacobian / RCE
+    parser.add_argument('--eck_key_dim', type=int, default=48)
+    parser.add_argument('--eck_topk', type=int, default=0, help='If >0, keep only top-k gates in ECKLock (hard lock)')
+    parser.add_argument('--rce_eps', type=float, default=0.1, help='label smoothing epsilon for RCE')
+    parser.add_argument('--rce_kernel_scale', type=float, default=0.5, help='kernel alignment scale for RCE')
+    parser.add_argument('--jreg_weight', type=float, default=0.0, help='weight for Jacobian regularization (j3)')
+    parser.add_argument('--jreg_iters', type=int, default=3, help='number of Hutchinson samples for jacobian est')
     parser.add_argument('--ckpt_dir', type=str, default='checkpoints')
+
     args = parser.parse_args()
     os.makedirs(args.ckpt_dir, exist_ok=True)
     train(args)
